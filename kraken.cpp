@@ -4146,6 +4146,8 @@ int Kraken_Decompress(const byte *src, size_t src_len, byte *dst, size_t dst_len
   Kraken_Destroy(dec);
   return offset;
 FAIL:
+  fprintf(stderr, "dec->src_used=%d\n", dec->src_used);
+  fprintf(stderr, "offset=%d\n", offset);
   Kraken_Destroy(dec);
   return -1;
 }
@@ -4183,7 +4185,7 @@ enum {
   kCompressor_Leviathan = 13,
 };
 
-bool arg_stdout, arg_force, arg_quiet, arg_dll;
+bool arg_stdout, arg_force, arg_quiet, arg_dll, arg_exploded;
 int arg_compressor = kCompressor_Kraken, arg_level = 4;
 char arg_direction;
 const char *verifyfolder;
@@ -4232,10 +4234,14 @@ int ParseCmdLine(int argc, char *argv[]) {
       case 'z':
       case 'd':
       case 'b':
+	  case 'p':
         if (arg_direction)
           return -1;
         arg_direction = c;
         break;
+	  case 'e':
+		arg_exploded = true;
+		break;
       case 'c':
         arg_stdout = true;
         break;
@@ -4350,8 +4356,9 @@ int main(int argc, char *argv[]) {
       (arg_direction != 'b' && (argc - argi) > 2) ||  // too many files
       (arg_direction == 't' && (argc - argi) != 2)     // missing argument for verify
       ) {
-    fprintf(stderr, "ooz v7.1 - compressor by Rarten\n\n"
-      "Usage: ooz [options] input [output]\n"
+    fprintf(stderr, "ooz v7.1 - compressor by Rarten - Modded by WhiteFang\n\n"
+      "Usage: ooz [options] input [output]\n\n"
+	  "Original Options:\n"
       " -c --stdout              write to stdout\n"
       " -d --decompress          decompress (default)\n"
       " -z --compress            compress\n"
@@ -4363,8 +4370,11 @@ int main(int argc, char *argv[]) {
       " -<1-9> --level=<-4..10>  compression level\n"
       " -m<k>                    [k|m|s|l|h] compressor selection\n"
       " --kraken --mermaid --selkie --leviathan --hydra    compressor selection\n\n"
+      "Modded options:\n"
+      " -p                        decompress a PoE bundle.bin\n"
+	  " -e                        explode the bundle.bin into its individual chunks (only in combination with -p)\n\n"
       "(Warning! not fuzz safe, so please trust the input)\n"
-      );
+	);
     return 1;
   }
   bool write_mode = (argi + 1 < argc) && (arg_direction != 't' && arg_direction != 'b');
@@ -4388,26 +4398,124 @@ int main(int argc, char *argv[]) {
     byte *output = NULL;
     int outbytes = 0;
 
-    if (arg_direction == 'z') {
-      // compress using the dll
-      if (arg_dll)
-        LoadLib();
-      output = new byte[input_size + 65536];
-      if (!output) error("memory error", curfile);
-      *(uint64*)output = input_size;
-      QueryPerformanceCounter((LARGE_INTEGER*)&start);
-      if (arg_dll) {
-        outbytes = OodLZ_Compress(arg_compressor, input, input_size, output + 8, arg_level, 0, 0, 0, 0, 0);
-      } else {
-        outbytes = CompressBlock(arg_compressor, input, output + 8, input_size, arg_level, 0, 0, 0);
-      }
-      if (outbytes < 0) error("compress failed", curfile);
-      outbytes += 8;
-      QueryPerformanceCounter((LARGE_INTEGER*)&end);
-      QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
-      double seconds = (double)(end - start) / freq;
-      if (!arg_quiet)
-        fprintf(stderr, "%-20s: %8d => %8d (%.2f seconds, %.2f MB/s)\n", argv[argi], input_size, outbytes, seconds, input_size * 1e-6 / seconds);
+	if (arg_direction == 'z') {
+		// compress using the dll
+		if (arg_dll)
+			LoadLib();
+		output = new byte[input_size + 65536];
+		if (!output) error("memory error", curfile);
+		*(uint64*)output = input_size;
+		QueryPerformanceCounter((LARGE_INTEGER*)&start);
+		if (arg_dll) {
+			outbytes = OodLZ_Compress(arg_compressor, input, input_size, output + 8, arg_level, 0, 0, 0, 0, 0);
+		}
+		else {
+			outbytes = CompressBlock(arg_compressor, input, output + 8, input_size, arg_level, 0, 0, 0);
+		}
+		if (outbytes < 0) error("compress failed", curfile);
+		outbytes += 8;
+		QueryPerformanceCounter((LARGE_INTEGER*)&end);
+		QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
+		double seconds = (double)(end - start) / freq;
+		if (!arg_quiet)
+			fprintf(stderr, "%-20s: %8d => %8d (%.2f seconds, %.2f MB/s)\n", argv[argi], input_size, outbytes, seconds, input_size * 1e-6 / seconds);
+	} else if(arg_direction == 'p') {
+		/*
+		# 010 Editor Template (for PoE bundle.bin files):
+uint32 uncompressed_size;
+uint32 total_payload_size;
+uint32 head_payload_size;
+struct head_payload_t {
+	enum <uint32> {Kraken_6 = 8, Mermaid_A = 9, Leviathan_C = 13 } first_file_encode;
+	uint32 unk03;
+	uint64 uncompressed_size2;
+	uint64 total_payload_size2;
+	uint32 entry_count;
+	uint32 unk28[5];
+	uint32 entry_sizes[entry_count];
+} head;
+
+local int i <hidden=true>;
+for (i = 0; i < head.entry_count; ++i) {
+	struct entry_t {
+		byte data[head.entry_sizes[i]];
+	} entry;
+}
+		*/
+		uint32 uncompressed_size = *(uint32*)input;
+		input += 4;
+		uint32 total_payload_size = *(uint32*)input;
+		input += 4;
+		uint32 head_payload_size = *(uint32*)input;
+		input += 4;
+		uint32 first_file_encode = *(uint32*)input;
+		input += 4;
+		//uint32 unk01 = *(uint32*)input;
+		input += 4;
+		uint64 uncompressed_size2 = *(uint64*)input;
+		input += 8;
+		uint64 total_payload_size2 = *(uint64*)input;
+		input += 8;
+		uint32 entry_count = *(uint32*)input;
+		input += 4;
+		//uint32 unk02 = *(uint32*)input;
+		input += 4;
+		//uint32 unk03 = *(uint32*)input;
+		input += 4;
+		//uint32 unk04 = *(uint32*)input;
+		input += 4;
+		//uint32 unk05 = *(uint32*)input;
+		input += 4;
+		//uint32 unk06 = *(uint32*)input;
+		input += 4;
+
+		uint32 *sizes = new uint32[entry_count];
+		for (int i = 0; i < entry_count; i++) {
+			sizes[i] = *(uint32*)input;
+			input += 4;
+		}
+		
+		byte *outputConcat = new byte[uncompressed_size + SAFE_SPACE];
+		int offset = 0;
+
+		uint32 lastEntry = entry_count - 1;
+		for (int i = 0; i < entry_count; i++) {
+			uint32 unpacked_size = (i == lastEntry) ? (uncompressed_size - (lastEntry * 262144)) : 262144;
+
+			output = new byte[unpacked_size + SAFE_SPACE];
+			outbytes = Kraken_Decompress(input, sizes[i], output, unpacked_size);
+
+			if (arg_exploded)
+			{
+				char* buffer = new char[strlen(argv[argi + 1]) + 100];
+				sprintf(buffer, "%s%d", argv[argi + 1], i);
+				FILE *f = fopen(buffer, "wb");
+				if (!f) error("file open for write error", argv[argi + 1]);
+				if (fwrite(output, 1, outbytes, f) != outbytes)
+					error("file write error", buffer);
+				fclose(f);
+				delete[] buffer;
+			}
+
+			memcpy(outputConcat + offset, output, outbytes);
+			offset += outbytes;
+
+			delete[] output;
+
+			input += sizes[i];
+		}
+
+		FILE *f = fopen(argv[argi + 1], "wb");
+		if (!f) error("file open for write error", argv[argi + 1]);
+		if (fwrite(outputConcat, 1, uncompressed_size, f) != uncompressed_size)
+			error("file write error", argv[argi + 1]);
+
+		fclose(f);
+
+		delete[] outputConcat;
+		delete[] sizes;
+		write_mode = false;
+
     } else {
       if (arg_dll)
         LoadLib();
@@ -4429,8 +4537,9 @@ int main(int argc, char *argv[]) {
       } else {
         outbytes = Kraken_Decompress(input + hdrsize, input_size - hdrsize, output, unpacked_size);
       }
-      if (outbytes != unpacked_size)
-        error("decompress error", curfile);
+	  fprintf(stderr, "outbytes=%d\n", outbytes);
+	  if (outbytes != unpacked_size)
+		  error("decompress error", curfile);
       QueryPerformanceCounter((LARGE_INTEGER*)&end);
       QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
       double seconds = (double)(end - start) / freq;
