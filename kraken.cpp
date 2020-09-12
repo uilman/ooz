@@ -18,6 +18,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "stdafx.h"
 #include <sys/stat.h>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <algorithm>
+
+using namespace std;
 
 // Header in front of each 256k block
 typedef struct KrakenHeader {
@@ -4346,6 +4353,228 @@ struct LRMCascade;
 int CompressBlock(int codec_id, uint8 *src_in, uint8 *dst_in, int src_size, int level,
                   const CompressOptions *compressopts, uint8 *src_window_base, LRMCascade *lrm);
 
+
+uint32 DecompressPoEBundle(byte* input, byte** output, bool writeChunks, char* fileName)
+{
+	/*
+	# 010 Editor Template (for PoE bundle.bin files):
+uint32 uncompressed_size;
+uint32 total_payload_size;
+uint32 head_payload_size;
+struct head_payload_t {
+	enum <uint32> {Kraken_6 = 8, Mermaid_A = 9, Leviathan_C = 13 } first_file_encode;
+	uint32 unk03;
+	uint64 uncompressed_size2;
+	uint64 total_payload_size2;
+	uint32 entry_count;
+	uint32 unk28[5];
+	uint32 entry_sizes[entry_count];
+} head;
+
+local int i <hidden=true>;
+for (i = 0; i < head.entry_count; ++i) {
+	struct entry_t {
+		byte data[head.entry_sizes[i]];
+	} entry;
+}
+		*/
+	uint32 uncompressed_size = *(uint32*)input;
+	input += 4;
+	uint32 total_payload_size = *(uint32*)input;
+	input += 4;
+	uint32 head_payload_size = *(uint32*)input;
+	input += 4;
+	uint32 first_file_encode = *(uint32*)input;
+	input += 4;
+	//uint32 unk01 = *(uint32*)input;
+	input += 4;
+	uint64 uncompressed_size2 = *(uint64*)input;
+	input += 8;
+	uint64 total_payload_size2 = *(uint64*)input;
+	input += 8;
+	uint32 entry_count = *(uint32*)input;
+	input += 4;
+	//uint32 unk02 = *(uint32*)input;
+	input += 4;
+	//uint32 unk03 = *(uint32*)input;
+	input += 4;
+	//uint32 unk04 = *(uint32*)input;
+	input += 4;
+	//uint32 unk05 = *(uint32*)input;
+	input += 4;
+	//uint32 unk06 = *(uint32*)input;
+	input += 4;
+
+	uint32 *sizes = new uint32[entry_count];
+	for (int i = 0; i < entry_count; i++) {
+		sizes[i] = *(uint32*)input;
+		input += 4;
+	}
+
+	*output = new byte[uncompressed_size + SAFE_SPACE];
+	int offset = 0;
+
+	uint32 lastEntry = entry_count - 1;
+	for (int i = 0; i < entry_count; i++) {
+		uint32 unpacked_size = (i == lastEntry) ? (uncompressed_size - (lastEntry * 262144)) : 262144;
+
+		byte* outputChunk = new byte[unpacked_size + SAFE_SPACE];
+		int outbytesChunk = Kraken_Decompress(input, sizes[i], outputChunk, unpacked_size);
+
+		if (writeChunks)
+		{
+			char* buffer = new char[strlen(fileName) + 100];
+			memset(buffer, NULL, sizeof(buffer));
+			sprintf(buffer, "%s%d", fileName, i);
+			FILE *f = fopen(buffer, "wb");
+			if (!f) error("file open for write error", fileName);
+			if (fwrite(outputChunk, 1, outbytesChunk, f) != outbytesChunk)
+				error("file write error", buffer);
+			fclose(f);
+			delete[] buffer;
+		}
+
+		memcpy(*output + offset, outputChunk, outbytesChunk);
+		offset += outbytesChunk;
+
+		delete[] outputChunk;
+
+		input += sizes[i];
+	}
+
+	delete[] sizes;
+
+	return uncompressed_size;
+}
+
+void SplitDecompressedPoEBundle(const char* bundleName, byte* bundleContent, int bundleSize, byte* bundleIndex, int bundleIndexSize, char* bundleNamesFileName) {
+	/*
+	# 010 Editor Template (for PoE index.bin):
+uint32 bundle_count;
+struct bundles_t
+{
+	local int i;
+	for (i = 0; i < bundle_count; ++i) {
+		struct {
+			uint32 name_length;
+			char name[name_length];
+			uint32 bundle_uncompressed_size;
+		} bundle_info;
+	}
+} bundles;
+
+uint32 file_count;
+struct files_t
+{
+	local int i;
+	for (i = 0; i < file_count; ++i) {
+		struct {
+			uint32 unk[2];
+			uint32 bundle_index <comment=BundleIndexComment>;
+			uint32 file_offset;
+			uint32 file_size;
+		} file_info;
+	}
+} files;
+
+string BundleIndexComment(int bundle_index)
+{
+ return bundles.bundle_info[bundle_index].name;
+}
+	*/
+	int bundleIdx = -1;
+	int bundleNameLength = strlen(bundleName);
+
+	uint32 bi_bundle_count = *(uint32*)bundleIndex;
+	bundleIndex += 4;
+	for (int i = 0; i < bi_bundle_count; i++) {
+		uint32 bi_bundle_name_length = *(uint32*)bundleIndex;
+		bundleIndex += 4;
+
+		char* bi_bundle_name = new char[bi_bundle_name_length];
+		memcpy(bi_bundle_name, bundleIndex, bi_bundle_name_length);
+		bundleIndex += bi_bundle_name_length;
+
+		uint32 bi_bundle_size = *(uint32*)bundleIndex;
+		bundleIndex += 4;
+
+		if (bi_bundle_name_length >= bundleNameLength &&
+			memicmp(bundleName, bi_bundle_name + (bi_bundle_name_length - bundleNameLength), bundleNameLength) == 0) {
+			bundleIdx = i;
+		}
+
+		delete[] bi_bundle_name;
+	}
+
+	if (bundleIdx == -1)
+		error("Failed to find Bundle in the Index.bin", bundleName);
+
+	struct bundle_file_info_t {
+		uint32 bundle_index;
+		uint32 offset;
+		uint32 size;
+	};
+
+	// Find the file info in the index.bin (bundle index)
+	vector<bundle_file_info_t> bundleFileInfos;
+	uint32 bi_file_count = *(uint32*)bundleIndex;
+	bundleIndex += 4;
+	for (int i = 0; i < bi_file_count; i++) {
+		bundle_file_info_t bundleFileInfo;
+
+		//uint32 unk01 = *(uint32*)bundleIndex;
+		bundleIndex += 4;
+		//uint32 unk02 = *(uint32*)bundleIndex;
+		bundleIndex += 4;
+		bundleFileInfo.bundle_index = *(uint32*)bundleIndex;
+		bundleIndex += 4;
+		bundleFileInfo.offset = *(uint32*)bundleIndex;
+		bundleIndex += 4;
+		bundleFileInfo.size = *(uint32*)bundleIndex;
+		bundleIndex += 4;
+
+		if (bundleFileInfo.bundle_index == bundleIdx)
+			bundleFileInfos.push_back(bundleFileInfo);
+	}
+
+	if (bundleFileInfos.size() == 0)
+		error("Failed to find Bundle Files in the Index.bin", bundleName);
+
+	fprintf(stderr, "Found %d file in bundle %s\n", bundleFileInfos.size(), bundleName);
+
+	// Find the bundle name in the index.txt (bundle names)
+	ifstream file;
+
+	file.open(bundleNamesFileName);
+
+	string line;
+	vector<string> fileNames;
+	while (getline(file, line)) {
+		// Check if the line ends with the bundle name
+		if (memicmp(line.c_str() + line.length() - bundleNameLength, bundleName, bundleNameLength) == 0) {
+			for (int i = 0; i < bundleFileInfos.size(); i++) {
+				bundle_file_info_t bundleFileInfo = bundleFileInfos.at(i);
+				if (!getline(file, line))
+					error("ran out of line!", bundleName);
+
+				replace(line.begin(), line.end(), '/', '_');
+
+				const char* fileName = line.c_str();
+				FILE *f = fopen(fileName, "wb");
+				if (!f) error("file open for write error", fileName);
+				if (fwrite(bundleContent + bundleFileInfo.offset, 1, bundleFileInfo.size, f) != bundleFileInfo.size)
+					error("file write error", fileName);
+				fclose(f);
+
+				fprintf(stderr, "Wrote file: %s\n", fileName);
+			}
+		}
+	}
+
+	file.close();
+}
+
+
 int main(int argc, char *argv[]) {
   int64_t start, end, freq;
   int argi;
@@ -4353,11 +4582,12 @@ int main(int argc, char *argv[]) {
   if (argc < 2 || 
       (argi = ParseCmdLine(argc, argv)) < 0 || 
       argi >= argc ||  // no files
-      (arg_direction != 'b' && (argc - argi) > 2) ||  // too many files
+	  (arg_direction == 'p' && (argc - argi) != 4 && (argc - argi) != 2) ||  // incorrect amount of files
+      (arg_direction != 'b' && arg_direction != 'p' && (argc - argi) > 2) ||  // too many files
       (arg_direction == 't' && (argc - argi) != 2)     // missing argument for verify
       ) {
     fprintf(stderr, "ooz v7.1 - compressor by Rarten - Modded by WhiteFang\n\n"
-      "Usage: ooz [options] input [output]\n\n"
+      "Usage: ooz [options] input [output] [index.bin] [index.txt]\n\n"
 	  "Original Options:\n"
       " -c --stdout              write to stdout\n"
       " -d --decompress          decompress (default)\n"
@@ -4372,12 +4602,15 @@ int main(int argc, char *argv[]) {
       " --kraken --mermaid --selkie --leviathan --hydra    compressor selection\n\n"
       "Modded options:\n"
       " -p                        decompress a PoE bundle.bin\n"
-	  " -e                        explode the bundle.bin into its individual chunks (only in combination with -p)\n\n"
+	  " -e                        explode the bundle.bin into its individual chunks (only in combination with -p)\n"
+	  "[index.bin] and [index.txt] arguments are optional and only available in combination with the -p option.\n"
+	  "When they're present, they'll be used to split the decoded bundle.bin into their respective files.\n\n"
       "(Warning! not fuzz safe, so please trust the input)\n"
 	);
     return 1;
   }
   bool write_mode = (argi + 1 < argc) && (arg_direction != 't' && arg_direction != 'b');
+  bool use_bundle_index = (argc - argi) == 4 && (arg_direction == 'p');
 
   if (!arg_force && write_mode) {
     struct stat sb;
@@ -4420,101 +4653,38 @@ int main(int argc, char *argv[]) {
 		if (!arg_quiet)
 			fprintf(stderr, "%-20s: %8d => %8d (%.2f seconds, %.2f MB/s)\n", argv[argi], input_size, outbytes, seconds, input_size * 1e-6 / seconds);
 	} else if(arg_direction == 'p') {
-		/*
-		# 010 Editor Template (for PoE bundle.bin files):
-uint32 uncompressed_size;
-uint32 total_payload_size;
-uint32 head_payload_size;
-struct head_payload_t {
-	enum <uint32> {Kraken_6 = 8, Mermaid_A = 9, Leviathan_C = 13 } first_file_encode;
-	uint32 unk03;
-	uint64 uncompressed_size2;
-	uint64 total_payload_size2;
-	uint32 entry_count;
-	uint32 unk28[5];
-	uint32 entry_sizes[entry_count];
-} head;
 
-local int i <hidden=true>;
-for (i = 0; i < head.entry_count; ++i) {
-	struct entry_t {
-		byte data[head.entry_sizes[i]];
-	} entry;
-}
-		*/
-		uint32 uncompressed_size = *(uint32*)input;
-		input += 4;
-		uint32 total_payload_size = *(uint32*)input;
-		input += 4;
-		uint32 head_payload_size = *(uint32*)input;
-		input += 4;
-		uint32 first_file_encode = *(uint32*)input;
-		input += 4;
-		//uint32 unk01 = *(uint32*)input;
-		input += 4;
-		uint64 uncompressed_size2 = *(uint64*)input;
-		input += 8;
-		uint64 total_payload_size2 = *(uint64*)input;
-		input += 8;
-		uint32 entry_count = *(uint32*)input;
-		input += 4;
-		//uint32 unk02 = *(uint32*)input;
-		input += 4;
-		//uint32 unk03 = *(uint32*)input;
-		input += 4;
-		//uint32 unk04 = *(uint32*)input;
-		input += 4;
-		//uint32 unk05 = *(uint32*)input;
-		input += 4;
-		//uint32 unk06 = *(uint32*)input;
-		input += 4;
+		fprintf(stderr, "Decompressing %s...\n", argv[argi + 1]);
+		outbytes = DecompressPoEBundle(input, &output, arg_exploded, argv[argi + 1]);
 
-		uint32 *sizes = new uint32[entry_count];
-		for (int i = 0; i < entry_count; i++) {
-			sizes[i] = *(uint32*)input;
-			input += 4;
+		if (use_bundle_index) {
+			char* indexBinFileName = argv[argi + 2];
+			fprintf(stderr, "Loading %s...\n", indexBinFileName);
+
+			int bundleIndexCompressedSize;
+			byte* bundleIndexCompressed = load_file(indexBinFileName, &bundleIndexCompressedSize);
+
+			fprintf(stderr, "Decompressing %s...\n", indexBinFileName);
+			byte* bundleIndex = NULL;
+			int bundleIndexSize = DecompressPoEBundle(bundleIndexCompressed, &bundleIndex, false, indexBinFileName);
+
+			fprintf(stderr, "Decompressed %s.\n", indexBinFileName);
+
+			int len = strlen(curfile) - strlen(".bundle.bin");
+			string s = string(curfile);
+			s = s.substr(0, len);
+			const char* bundleName = s.c_str();
+
+			fprintf(stderr, "Splitting %s into file(s)...\n", bundleName);
+
+			SplitDecompressedPoEBundle(bundleName, output, outbytes, bundleIndex, bundleIndexSize, argv[argi + 3]);
+
+			fprintf(stderr, "Splitted %s into file(s).\n", bundleName);
+
+			delete[] bundleName;
+			delete[] bundleIndex;
+			delete[] bundleIndexCompressed;
 		}
-		
-		byte *outputConcat = new byte[uncompressed_size + SAFE_SPACE];
-		int offset = 0;
-
-		uint32 lastEntry = entry_count - 1;
-		for (int i = 0; i < entry_count; i++) {
-			uint32 unpacked_size = (i == lastEntry) ? (uncompressed_size - (lastEntry * 262144)) : 262144;
-
-			output = new byte[unpacked_size + SAFE_SPACE];
-			outbytes = Kraken_Decompress(input, sizes[i], output, unpacked_size);
-
-			if (arg_exploded)
-			{
-				char* buffer = new char[strlen(argv[argi + 1]) + 100];
-				sprintf(buffer, "%s%d", argv[argi + 1], i);
-				FILE *f = fopen(buffer, "wb");
-				if (!f) error("file open for write error", argv[argi + 1]);
-				if (fwrite(output, 1, outbytes, f) != outbytes)
-					error("file write error", buffer);
-				fclose(f);
-				delete[] buffer;
-			}
-
-			memcpy(outputConcat + offset, output, outbytes);
-			offset += outbytes;
-
-			delete[] output;
-
-			input += sizes[i];
-		}
-
-		FILE *f = fopen(argv[argi + 1], "wb");
-		if (!f) error("file open for write error", argv[argi + 1]);
-		if (fwrite(outputConcat, 1, uncompressed_size, f) != uncompressed_size)
-			error("file write error", argv[argi + 1]);
-
-		fclose(f);
-
-		delete[] outputConcat;
-		delete[] sizes;
-		write_mode = false;
 
     } else {
       if (arg_dll)
@@ -4586,4 +4756,3 @@ for (i = 0; i < head.entry_count; ++i) {
     fprintf(stderr, "%d files verified OK!\n", nverify);
   return 0;
 }
-
